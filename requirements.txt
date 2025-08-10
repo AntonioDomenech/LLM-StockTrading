@@ -1,0 +1,17 @@
+streamlit>=1.36
+python-dotenv>=1.0
+openai>=1.40
+requests>=2.31
+yfinance>=0.2.52
+pandas>=2.2
+numpy>=1.26
+polars>=0.20
+tqdm>=4.66
+scikit-learn>=1.4
+transformers>=4.41
+pydantic>=2.7
+annotated-types>=0.6
+sortedcontainers>=2.4
+httpx>=0.27
+faiss-cpu
+rich>=13.7
