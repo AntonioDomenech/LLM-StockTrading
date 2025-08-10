@@ -1,44 +1,68 @@
-import os
-from typing import Callable, Dict, Any, Union
-from openai import OpenAI
+import os, json
+from typing import Dict, Any, Optional, List
+from tenacity import retry, wait_random_exponential, stop_after_attempt
 
-class LongerThanContextError(Exception):
-    pass
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-class ChatOpenAICompatible:
-    def __init__(self, end_point: str, model: str, system_message: str="You are a helpful assistant.", other_parameters: Union[Dict[str, Any], None]=None):
-        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        self.model = model
-        self.system_message = system_message
-        self.other_parameters = {} if other_parameters is None else other_parameters
+def _client():
+    if OpenAI is None:
+        return None
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY", None))
 
-    def guardrail_endpoint(self) -> Callable:
-        def end_point(input: str, **kwargs) -> str:
-            messages = [
-                {"role": "system", "content": self.system_message},
-                {"role": "user", "content": input},
-            ]
-            temperature = float(self.other_parameters.get("temperature", 0.2))
-            max_tokens = int(self.other_parameters.get("max_tokens", 1024))
-            try:
-                resp = self.client.responses.create(
-                    model=self.model,
-                    input={"messages": messages},
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                )
-            except Exception as e:
-                msg = str(e).lower()
-                if "token" in msg and ("max" in msg or "context" in msg):
-                    raise LongerThanContextError
-                raise
-            if hasattr(resp, "output_text"):
-                return resp.output_text
-            out = []
-            for item in getattr(resp, "output", []):
-                if getattr(item, "type", "") == "message":
-                    for c in item.message.content:
-                        if getattr(c, "type", "") == "output_text":
-                            out.append(c.text)
-            return "".join(out) if out else ""
-        return end_point
+@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(3))
+def call_llm(messages: List[Dict[str,str]], model: str, json_schema: Optional[Dict]=None, max_output_tokens: int=500) -> str:
+    """
+    Tries Responses API first; falls back to Chat Completions with JSON best-effort.
+    Returns the raw text content from the model.
+    """
+    client = _client()
+    if client is None:
+        # No OpenAI client, return a naive policy: hold
+        return '{"action": "hold", "confidence": 0.0, "rationale": "No LLM key; defaulting to hold."}'
+
+    # Shape messages for either API
+    # Attempt Responses API
+    try:
+        if json_schema:
+            resp = client.responses.create(
+                model=model,
+                input=[{"role": m["role"], "content": m["content"]} for m in messages],
+                response_format={"type":"json_schema","json_schema":{"name":"trading_decision","schema":json_schema}},
+                max_output_tokens=max_output_tokens,
+            )
+        else:
+            resp = client.responses.create(
+                model=model,
+                input=[{"role": m["role"], "content": m["content"]} for m in messages],
+                max_output_tokens=max_output_tokens,
+            )
+        # Extract text
+        if resp and resp.output and len(resp.output) > 0:
+            parts = []
+            for o in resp.output:
+                if getattr(o, "type", None) == "output_text":
+                    parts.append(o.text)
+            if parts:
+                return "\n".join(parts)
+        # fallback extraction
+        return getattr(resp, "output_text", "") or ""
+    except Exception:
+        # Fallback to Chat Completions
+        try:
+            if json_schema:
+                # force JSON via system instruction
+                sys_msg = {"role":"system","content":"Return ONLY valid JSON for the following schema. Do not include any extra text."}
+                mm = [sys_msg] + messages
+            else:
+                mm = messages
+            cc = client.chat.completions.create(
+                model=model,
+                messages=mm,
+                temperature=0.2
+            )
+            return cc.choices[0].message.content
+        except Exception:
+            return '{"action": "hold", "confidence": 0.0, "rationale": "LLM call failed; default hold."}'

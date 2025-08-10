@@ -1,133 +1,82 @@
-import os
-import shutil
-import pickle
-from datetime import date
-from typing import List, Dict, Tuple, Union, Any
-from pydantic import BaseModel, ValidationError
-
-# type alias
-market_info_type = Tuple[
-    date,  # cur date
-    float,  # cur price
-    Union[str, None],  # cur filing_k
-    Union[str, None],  # cur filing_q
-    List[str],  # cur news
-    float,  # cur record
-    bool,  # termination flag
-]
-terminated_market_info_type = Tuple[None, None, None, None, None, None, bool]
-
-
-# env data structure validation
-class OneDateRecord(BaseModel):
-    price: Dict[str, float]
-    filing_k: Dict[str, str]
-    filing_q: Dict[str, str]
-    news: Dict[str, List[str]]
-
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, Optional
+import yfinance as yf
+from datetime import datetime, timedelta
 
 class MarketEnvironment:
-    def __init__(
-        self,
-        env_data_pkl: Dict[date, Dict[str, Any]],
-        start_date: date,
-        end_date: date,
-        symbol: str,
-    ) -> None:
-        # validate structure
-        first_date = list(env_data_pkl.keys())[0]
-        if not isinstance(first_date, date):
-            raise TypeError("env_data_pkl keys must be date type")
-        try:
-            OneDateRecord.model_validate(env_data_pkl[first_date])
-        except ValidationError as e:
-            raise e
-        self.date_series = env_data_pkl.keys()
-        if (start_date not in self.date_series) or (end_date not in self.date_series):
-            raise ValueError("start_date and end_date must be in env_data_pkl keys")
-        self.date_series = [
-            i for i in self.date_series if (i >= start_date) and (i <= end_date)
-        ]
+    """
+    Daily-step environment.
+    Position model: integer number of shares (long-only by default).
+    """
+    def __init__(self, df: pd.DataFrame, initial_cash: float = 10000.0, allow_short: bool=False, max_position:int=1):
+        assert "Close" in df.columns, "DataFrame must have a 'Close' column."
+        self.df = df.copy()
+        self.df.sort_index(inplace=True)
+        self.idx = 0
+        self.initial_cash = float(initial_cash)
+        self.cash = float(initial_cash)
+        self.position = 0
+        self.allow_short = allow_short
+        self.max_position = max_position
+        self.equity_curve = []  # (date, equity)
+        self.actions = []       # list of dicts per step
+        self.done = False
 
-        self.date_series = sorted(self.date_series)
-        self.date_series_keep = self.date_series.copy()
-        self.simulation_length = len(self.date_series) - 1
-        self.start_date = start_date
-        self.end_date = end_date
-        self.cur_date = None
-        self.env_data = env_data_pkl
-        self.symbol = symbol
+    @staticmethod
+    def load_prices(symbol: str, start: str, end: str) -> pd.DataFrame:
+        df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
+        if df is None or len(df) == 0:
+            raise RuntimeError(f"yfinance returned no data for {symbol} between {start} and {end}")
+        return df
 
-    def reset(self) -> None:
-        self.date_series = [
-            i
-            for i in self.date_series_keep
-            if (i >= self.start_date) and (i <= self.end_date)
-        ]
-        self.date_series = sorted(self.date_series)
-        self.cur_date = None
+    @property
+    def current_date(self):
+        return self.df.index[self.idx]
 
-    def step(self) -> Union[market_info_type, terminated_market_info_type]:
-        try:
-            self.cur_date = self.date_series.pop(0)  # type: ignore
-            future_date = self.date_series[0]  # type: ignore
-        except IndexError:
-            return None, None, None, None, None, None, True
+    @property
+    def current_price(self):
+        return float(self.df.iloc[self.idx]["Close"])
 
-        cur_date = self.cur_date
-        cur_price = self.env_data[self.cur_date]["price"]
-        future_price = self.env_data[future_date]["price"]
-        cur_filing_k = self.env_data[self.cur_date]["filing_k"]
-        cur_filing_q = self.env_data[self.cur_date]["filing_q"]
-        if self.env_data[self.cur_date]["news"] != {}:
-            cur_news = self.env_data[self.cur_date]["news"]
-        else:
-            cur_news = {self.symbol: ''}
-            
-        cur_record = {
-            symbol: future_price[symbol] - cur_price[symbol]  # type: ignore
-            for symbol in cur_price  # type: ignore
-        }
+    def step(self, action: str):
+        """
+        action: 'buy', 'sell', 'hold'
+        Executes at current day's close and advances one day.
+        """
+        if self.done:
+            return
 
-        # handle none filing case
-        if len(cur_filing_k) == 0:
-            cur_filing_k = None
-        else:
-            cur_filing_k = cur_filing_k[self.symbol]
-        if len(cur_filing_q) == 0:
-            cur_filing_q = None
-        else:
-            cur_filing_q = cur_filing_q[self.symbol]
+        price = self.current_price
+        date = self.current_date
 
-        return (
-            cur_date,
-            cur_price[self.symbol],
-            cur_filing_k,
-            cur_filing_q,
-            cur_news[self.symbol],
-            cur_record[self.symbol],
-            False,
-        )
+        # Execute action
+        if action == "buy":
+            # buy 1 unit if allowed
+            if self.position < self.max_position:
+                self.cash -= price
+                self.position += 1
+        elif action == "sell":
+            # sell 1 unit if we have one (shorting optional)
+            if self.position > 0:
+                self.cash += price
+                self.position -= 1
+            elif self.allow_short:
+                self.cash += price
+                self.position -= 1
+        # else hold
 
-    def save_checkpoint(self, path: str, force: bool = False) -> None:
-        # Ensure the parent 'path' (e.g., .../final) exists
-        os.makedirs(path, exist_ok=True)
-        env_dir = os.path.join(path, "env")
-        if os.path.exists(env_dir):
-            if force:
-                shutil.rmtree(env_dir)
-            else:
-                raise FileExistsError(f"Path {env_dir} already exists")
-        os.makedirs(env_dir, exist_ok=True)
-        with open(os.path.join(env_dir, "env.pkl"), "wb") as f:
-            pickle.dump(self, f)
+        equity = self.cash + self.position * price
+        self.equity_curve.append((date, equity))
+        self.actions.append({"date": date, "price": price, "action": action, "position": self.position, "equity": equity})
 
-    @classmethod
-    def load_checkpoint(cls, path: str) -> "MarketEnvironment":
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Path {path} does not exists")
-        with open(os.path.join(path, "env.pkl"), "rb") as f:
-            env = pickle.load(f)
-        # update
-        env.simulation_length = len(env.date_series)
-        return env
+        self.idx += 1
+        if self.idx >= len(self.df.index):
+            self.done = True
+
+    def reset_portfolio(self):
+        self.cash = self.initial_cash
+        self.position = 0
+        self.equity_curve.clear()
+        self.actions.clear()
+        self.idx = 0
+        self.done = False

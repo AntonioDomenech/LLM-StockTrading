@@ -1,286 +1,191 @@
-
-import os
-import json
-from datetime import datetime, date
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
+import os, io, json
+from datetime import datetime, timedelta
+import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
-
-# --- Load environment variables from .env early ---
-try:
-    from dotenv import load_dotenv, find_dotenv
-    # Try common locations: CWD, script dir
-    _ = load_dotenv(find_dotenv(usecwd=True), override=False)
-    _ = load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
-    _ = load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
-except Exception as _e:
-    pass
-
-# ---- Core imports from your project ----
-from finmem_core.agent import LLMAgent
-from finmem_core.run_type import RunMode
+from finmem_core.config import AppConfig, normalize_and_validate_cfg
 from finmem_core.environment import MarketEnvironment
-from finmem_core.config_utils import normalize_and_validate_cfg
-from finmem_core.checkpoint_utils import resolve_test_checkpoint, list_run_candidates
+from finmem_core.news import fetch_news
+from finmem_core.memorydb import BrainDB, make_embedder_openai_or_hash
+from finmem_core.agent import LLMAgent
+from finmem_core.metrics import equity_stats
+from finmem_core.plot import plot_price_and_equity
+from finmem_core.utils import ensure_dir, stamp_dir, save_json, print_warnings
 
-APP_TITLE = "FinMem — Training & Evaluation"
-RUNS_BASE = "data/runs"
+load_dotenv()
 
+st.set_page_config(page_title="FINMEM Streamlit Clean", layout="wide")
+st.title("FINMEM — Clean Refactor (Daily Trading Agent)")
 
-# =============== Small utilities ===============
-
-def stamp_dir(base: str) -> str:
-    """Create a timestamped directory under base and return its path."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(base, ts)
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def ensure_dir(p: str) -> None:
-    Path(p).mkdir(parents=True, exist_ok=True)
-
-def _safe_len(x) -> int:
-    try:
-        return len(x)
-    except Exception:
-        return 0
-
-
-# =============== Sidebar (clean layout) ===============
-
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-
+# Sidebar controls
 with st.sidebar:
-    st.header("Run")
-    run_mode = st.radio("Mode", options=["Train", "Test"], horizontal=True, index=0)
-    run_name = st.text_input("Run name", value="my_run")
-    symbol = st.text_input("Trading symbol", value="AAPL")
+    st.header("Configuration")
+    symbol = st.text_input("Symbol", value="AAPL")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Start", value=pd.to_datetime("2022-01-01")).isoformat()
+    with col2:
+        end_date = st.date_input("End", value=pd.to_datetime("2023-01-01")).isoformat()
+
+    mode = st.selectbox("Mode", ["Train", "Test"], index=0)
+    persona = st.selectbox("Persona", ["Secure","Balanced","Risk"], index=1)
+    look_back_window = st.slider("Look-back window (days)", 5, 120, 30)
+    k_memory = st.slider("K memory retrieved", 4, 32, 8)
+    model_name = st.text_input("OpenAI model", value=os.getenv("DEFAULT_MODEL","gpt-4o-mini"))
+    embed_model = st.text_input("Embedding model", value=os.getenv("DEFAULT_EMBED_MODEL","text-embedding-3-small"))
+    news_source = st.selectbox("News source", ["Auto","NewsAPI","Alpaca","None"], index=0)
+    initial_cash = st.number_input("Initial cash", min_value=100.0, value=10000.0, step=100.0)
+    max_position = st.number_input("Max position (units)", min_value=0, value=1, step=1)
+    allow_short = st.checkbox("Allow short", value=False)
 
     st.divider()
-    st.header("Dates")
-    colA, colB = st.columns(2)
-    with colA:
-        start_date = st.date_input("Start", value=date(2022, 1, 3))
-    with colB:
-        end_date = st.date_input("End", value=date(2023, 1, 3))
+    uploaded_env = st.file_uploader("Optional: load pickled price DataFrame", type=["pkl"])
+    run_btn = st.button("Run")
 
-    st.divider()
-    st.header("Agent & Memory")
-    agent_name = st.text_input("Agent name", value="agent_1")
-    look_back = st.number_input("Look-back window (days)", min_value=1, max_value=365, value=30, step=1)
-    top_k = st.slider("Top-K retrieval", min_value=1, max_value=10, value=5, step=1)
-    character_string = st.text_area("Character / System prompt", value="You are a helpful trading assistant.")
-
-    st.divider()
-    st.header("Embedding")
-    emb_model = st.selectbox(
-        "Embedding model",
-        options=[
-            "text-embedding-3-small",
-            "text-embedding-3-large",
-            "text-embedding-ada-002",
-        ],
-        index=0,
-    )
-    chunk_chars = st.number_input("Chunk char size", min_value=256, max_value=16000, value=6000, step=256)
-
-    st.divider()
-    st.header("OpenAI / Chat")
-    chat_model = st.text_input("Chat model", value="gpt-4o-mini")
-    max_tokens = st.number_input("Max tokens per reply", min_value=64, max_value=8192, value=512, step=32)
-    temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.05)
-
-    st.divider()
-    run_btn = st.button("Run 🚀", use_container_width=True)
-
-
-# =============== Build the config dict and normalize ===============
-
-def build_cfg() -> Dict[str, Any]:
-    cfg = {
-        "general": {
-            "agent_name": agent_name,
-            "trading_symbol": symbol,
-            "character_string": character_string,
-            "look_back_window_size": int(look_back),
-            "top_k": int(top_k),
-        },
-        "embedding": {
-            "model_name": emb_model,
-            "chunk_char_size": int(chunk_chars),
-        },
-        "chat": {
-        "end_point": "openai",
-        "model": chat_model,
-        "system_message": character_string,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature)
-    },
-        # default thresholds per layer; config_utils will backfill if any missing
-        "short": {},
-        "mid": {},
-        "long": {},
-        "reflection": {},
-    }
-    return cfg
-
-cfg = build_cfg()
+# Build config
+cfg = AppConfig(
+    symbol=symbol,
+    start_date=start_date,
+    end_date=end_date,
+    mode=mode,
+    persona=persona,
+    look_back_window=look_back_window,
+    k_memory=k_memory,
+    model=model_name,
+    embed_model=embed_model,
+    news_source=news_source,
+    initial_cash=float(initial_cash),
+    max_position=int(max_position),
+    allow_short=bool(allow_short)
+)
 cfg = normalize_and_validate_cfg(cfg)
 
+warn_text = print_warnings(getattr(cfg, "_normalized_warnings", []))
+if warn_text:
+    st.sidebar.warning(warn_text)
 
-
-
-# =============== TRAIN ===============
-
-
-
-def _init_environment_robust(symbol: str, start_date: date, end_date: date) -> MarketEnvironment:
-    """
-    Build a MarketEnvironment reliably by generating the required `env_data_pkl` dict
-    from market data and news, then instantiating with the full signature.
-    This avoids signature drift across repo variants.
-    """
-    import datetime as dt
-    from finmem_core import data as data_utils
-    from finmem_core import news as news_utils
-
-    # 1) Download OHLCV (inclusive end)
-    start_dt = dt.datetime.combine(start_date, dt.time.min)
-    end_dt = dt.datetime.combine(end_date, dt.time.max)
-    df = data_utils.download_ohlcv(symbol, start_dt, end_dt, interval="1d")
-    if df is None or len(df) == 0:
-        raise ValueError(f"No OHLCV data returned for {symbol} between {start_date} and {end_date}")
-
-    # 2) Fetch news from preferred source (auto chooses NEWSAPI if key present, else Alpaca if keys present)
-    source_used, articles = news_utils.fetch_news(symbol, start_dt, end_dt, source_preference="auto")
-    # Non-fatal if no news; we still build environment using prices only
-    articles = articles or []
-
-    # 3) Build env_data dictionary
-    env_dict = data_utils.build_env(symbol, df, articles)
-
-    # 4) Instantiate environment with the full, strict signature
-    env = MarketEnvironment(
-        env_data_pkl=env_dict,
-        start_date=start_date,
-        end_date=end_date,
-        symbol=symbol,
-    )
-
-    # 5) Small UI hint about news source used (optional)
-    try:
-        st.caption(f"News source: **{source_used}** · Articles fetched: {len(articles)}")
-    except Exception:
-        pass
-    return env
-
-
-def _train_once() -> Tuple[str, str]:
-    # Prepare output folders
-    out_dir = stamp_dir(RUNS_BASE)
-    out_dir_named = os.path.join(out_dir, run_name)
-    final_dir = os.path.join(out_dir_named, "final")
-    ensure_dir(final_dir)
-
-    st.subheader("Training")
-    with st.status("Initializing...", expanded=False) as status:
-        # Build env
-        env = _init_environment_robust(symbol, start_date, end_date)
-
-        # Build agent
-        the_agent = LLMAgent.from_config(cfg)
-
-        # Steps
-        keys = getattr(env, "keys", [])
-        sim_len = getattr(env, "simulation_length", _safe_len(keys) - 1)
-        steps = max(int(sim_len), 1)
-
-        progress = st.progress(0.0, text=f"Training... 0 / {steps}")
-        completed = 0
-
-        status.update(label="Running training loop...", state="running")
-        for _ in range(steps):
-            mi = env.step()
-            # If env returns (...., done: bool), break when done
-            if isinstance(mi, tuple) and len(mi) > 0 and isinstance(mi[-1], bool) and mi[-1]:
-                break
-            the_agent.step(market_info=mi, run_mode=RunMode.Train)
-            completed += 1
-            progress.progress(min(completed / steps, 1.0), text=f"Training... {completed} / {steps}")
-
-        # Save
-        status.update(label="Saving checkpoints...", state="running")
-        save_dir = final_dir
-        env.save_checkpoint(path=os.path.join(save_dir, "env"), force=True)
-        the_agent.save_checkpoint(path=save_dir, force=True)
-
-        status.update(label=f"Finished Train. Results saved under {save_dir}", state="complete")
-
-    return (os.path.join(save_dir, "env"), save_dir)
-
-
-# =============== TEST ===============
-
-def _test_once() -> None:
-    st.subheader("Test / Evaluation")
-    # Show a quick list of latest runs for clarity
-    cands = list_run_candidates(RUNS_BASE)
-    if len(cands) > 0:
-        st.caption("Latest checkpoints:")
-        for i, c in enumerate(cands[:5], start=1):
-            st.write(f"{i}. final: `{c['final']}`")
-
-    try:
-        env_dir, agent_dir = resolve_test_checkpoint(RUNS_BASE)
-    except FileNotFoundError:
-        st.error("No TRAIN checkpoint found. Run a Train first.")
-        return
-
-    st.info(f"Loading checkpoint:\n- env: `{env_dir}`\n- agent: `{agent_dir}`")
-    env = MarketEnvironment.load_checkpoint(env_dir)
-    the_agent = LLMAgent.load_checkpoint(agent_dir)
-
-    # Simple sanity step (optional)
-try:
-    # 1) reset pointer if available
-    if hasattr(env, "reset"):
-        try:
-            env.reset()
-        except Exception:
-            pass
-
-    # 2) get one step robustly
-    mi_raw = env.step()
-    mi, done = None, False
-    if isinstance(mi_raw, tuple) and mi_raw:
-        # assume (payload, ..., done: bool) OR (payload, done)
-        if isinstance(mi_raw[-1], bool):
-            done = mi_raw[-1]
-            mi = mi_raw[0] if len(mi_raw) >= 2 else None
-        else:
-            mi = mi_raw[0]
-    else:
-        mi = mi_raw
-
-    # 3) run agent only if we actually have a market_info and not done
-    if mi is None or done:
-        st.info("Loaded checkpoint, but no testable step is available (end-of-episode). Skipping smoke test.")
-    else:
-        the_agent.step(market_info=mi, run_mode=RunMode.Test)
-        st.success("Loaded checkpoint and executed one TEST step successfully.")
-except Exception as e:
-    st.warning(f"Loaded checkpoint, but a TEST step raised: {e!r}. Continuing to dashboard...")
-
-
-
-# =============== Entry point ===============
+# Load prices
+@st.cache_data(show_spinner=False)
+def _load_prices_cached(symbol, start, end):
+    return MarketEnvironment.load_prices(symbol, start, end)
 
 if run_btn:
-    if run_mode == "Train":
-        _train_once()
-        st.toast("Training completed and saved ✅")
+    st.toast("Starting run…")
+
+    # Load price DF either from upload or yfinance
+    if uploaded_env is not None:
+        df = pd.read_pickle(uploaded_env)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
     else:
-        _test_once()
+        df = _load_prices_cached(cfg.symbol, cfg.start_date, cfg.end_date)
+
+    # Build environment
+    env = MarketEnvironment(df, initial_cash=cfg.initial_cash, allow_short=cfg.allow_short, max_position=cfg.max_position)
+
+    # Memory + embedder
+    import os as _os
+    from openai import OpenAI as _OpenAI
+    client = None
+    try:
+        if _os.getenv("OPENAI_API_KEY"):
+            client = _OpenAI(api_key=_os.getenv("OPENAI_API_KEY"))
+    except Exception:
+        client = None
+    embed_fn = make_embedder_openai_or_hash(client, cfg.embed_model)
+    memdb = BrainDB(embed_fn)
+
+    # Agent
+    agent = LLMAgent(cfg.persona, cfg.model)
+
+    # Prepare output dirs
+    run_dir = stamp_dir("data/runs")
+    save_json(os.path.join(run_dir, "config.json"), cfg.model_dump())
+
+    # Iterate
+    st.subheader("Run Progress")
+    progress = st.progress(0)
+    total = len(df.index)
+    table_rows = []
+    news_cache = {}
+
+    for i, current_date in enumerate(df.index):
+        # Price window
+        lb = max(0, i - cfg.look_back_window + 1)
+        pw = [(d.strftime("%Y-%m-%d"), float(df.iloc[j]["Close"])) for j, d in enumerate(df.index[lb:i+1], start=lb)]
+
+        # Fetch news once per date
+        date_str = current_date.strftime("%Y-%m-%d")
+        if date_str not in news_cache:
+            news_cache[date_str] = fetch_news(cfg.symbol, date_str, cfg.news_source, limit=8)
+        news_list = news_cache[date_str]
+
+        # Retrieve memories with last rationale + prices as query
+        query = f"{cfg.symbol} {date_str} recent trend {pw[-1][1]:.2f}"
+        retrieved = memdb.retrieve(query, k=cfg.k_memory)
+
+        # Get decision
+        out = agent.step(cfg.symbol, date_str, pw, news_list, retrieved)
+        action = out["action"]
+        # Step env
+        env.step(action)
+
+        # Update memories lightly: store rationale in short, summaries in reflections
+        if out.get("rationale"):
+            memdb.add("short", f"{date_str} action={action} rationale={out['rationale'][:500]}", meta={"date":date_str})
+        # Periodically store reflection
+        if i % max(1, cfg.look_back_window//5) == 0 and i > 0:
+            memdb.add("reflections", f"Reflection up to {date_str}: trending equity={env.equity_curve[-1][1]:.2f}", meta={"date":date_str})
+
+        # Accumulate table row
+        env_row = env.actions[-1]
+        row = {
+            "date": env_row["date"],
+            "price": env_row["price"],
+            "action": env_row["action"],
+            "position": env_row["position"],
+            "equity": env_row["equity"],
+            "confidence": out.get("confidence", 0.0),
+            "rationale": out.get("rationale","")[:300]
+        }
+        table_rows.append(row)
+
+        if i % 5 == 0 or i == total-1:
+            progress.progress(int((i+1)/total * 100))
+
+    # Results
+    actions_df = pd.DataFrame(table_rows)
+    actions_df.sort_values("date", inplace=True)
+    st.success("Run complete ✅")
+
+    # Metrics
+    stats = equity_stats(actions_df, cfg.initial_cash)
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Cumulative Return", f"{stats['cum_return']*100:.2f}%")
+    colB.metric("Sharpe (approx)", f"{stats['sharpe']:.2f}")
+    colC.metric("Max Drawdown", f"{stats['max_dd']*100:.2f}%")
+    colD.metric("# Trades", f"{stats['trades']}")
+
+    # Plot
+    buf = plot_price_and_equity(actions_df["date"].tolist(), actions_df["price"].tolist(), actions_df["equity"].tolist())
+    st.image(buf, caption="Price vs. Equity")
+
+    # Actions table
+    st.subheader("Actions")
+    st.dataframe(actions_df, use_container_width=True, hide_index=True)
+
+    # News used: last day (expandable)
+    st.subheader("News (example: last day)")
+    last_day = actions_df["date"].iloc[-1]
+    last_day_str = last_day.strftime("%Y-%m-%d")
+    used = news_cache.get(last_day_str, [])
+    if used:
+        with st.expander(f"Articles on {last_day_str} ({len(used)})"):
+            for n in used:
+                st.markdown(f"- **{n.get('title','')}** — *{n.get('source','')}*  \n{n.get('url','')}")
+
+    # Save artifacts
+    actions_df.to_csv(os.path.join(run_dir, "actions.csv"), index=False)
+    st.write("Artifacts saved to:", run_dir)
+    st.code(os.path.abspath(run_dir), language="bash")
